@@ -22,7 +22,7 @@ type KEY struct {
 
 // Create empty store map
 // Store holding x and y variable
-var store = make(map[string]int)
+var store = make(map[string]KEY)
 
 type Timestamp int64
 
@@ -65,7 +65,11 @@ type TransactionService int64
 type Transaction struct {
 	Timestamp Timestamp
 	TxID      string
+	// Add channel
 }
+
+// Create map to store every transaction
+var transaction = make(map[string]*Transaction)
 
 func (s *TransactionService) BeginTransaction(args *BeginArgs, reply *BeginReply) error {
 	// Get timestamp of current time
@@ -73,6 +77,9 @@ func (s *TransactionService) BeginTransaction(args *BeginArgs, reply *BeginReply
 
 	// Add it to reply
 	reply.Timestamp = ts
+
+	// Add the transaction
+	transaction[args.TxID].Timestamp = ts
 
 	return nil
 }
