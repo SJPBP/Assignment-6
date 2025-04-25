@@ -4,14 +4,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/rpc"
+	"os"
 	"time"
 )
-
-type Timestamp int64
 
 type BeginArgs struct {
 	TxID string
@@ -49,10 +49,12 @@ type CommitReply struct {
 
 type TransactionService int64
 
+type Timestamp int64
+
 type Transaction struct {
 	Timestamp Timestamp
 	TxID      string
-	// Add channel
+	abort     chan bool
 }
 
 // Create map to store every transaction
@@ -61,8 +63,8 @@ var transaction = make(map[string]*Transaction)
 // Struct for key used for transaction
 type KEY struct {
 	committed_value     int
-	committed_timestamp int
-	RTS                 []int
+	committed_timestamp Timestamp
+	RTS                 []Timestamp
 	TW                  map[Timestamp]int
 }
 
@@ -78,19 +80,145 @@ func (s *TransactionService) BeginTransaction(args *BeginArgs, reply *BeginReply
 	reply.Timestamp = ts
 
 	// Add the transaction
-	transaction[args.TxID].Timestamp = ts
+	transaction[args.TxID] = &Transaction{
+		Timestamp: ts,
+		TxID:      args.TxID,
+		// Create the abort channel
+		abort: make(chan bool),
+	}
 
 	return nil
 }
 
+func get_D_of_maximum_TW(Tc Timestamp, key *KEY) Timestamp {
+	var max_TW Timestamp
+	var found bool
+
+	for ts := range key.TW {
+		if ts <= Tc {
+			if !found || ts > max_TW {
+				max_TW = ts
+				found = true
+			}
+		}
+	}
+	return max_TW
+}
+
+func add_RTS(Tc Timestamp, key *KEY) {
+	already_present := false
+	for _, rts := range key.RTS {
+		if rts == Tc {
+			already_present = true
+			break
+		}
+	}
+	if !already_present {
+		key.RTS = append(key.RTS, Tc)
+	}
+}
+
 func (s TransactionService) Read(args *ReadArgs, reply *ReadReply) error {
+	// Get client transaction
 	tx, ok := transaction[args.TxID]
+
 	if ok {
+		// Get Tc of client
+		Tc := tx.Timestamp
+
+		// Get key the client asked for
 		key, ok := store[args.Key]
+
 		if ok {
-			// if tx Timestamp > key commited timestamp
-			if tx.Timestamp > key.committed_timestamp {
-				//
+			for {
+				if Tc > Timestamp(key.committed_timestamp) {
+					D_selected := get_D_of_maximum_TW(Tc, key)
+
+					if key.committed_timestamp == Timestamp(D_selected) {
+						reply.Value = key.TW[D_selected]
+						add_RTS(Tc, key)
+						break
+
+					} else if D_selected == Tc {
+						reply.Value = key.TW[D_selected]
+						break
+
+					} else {
+						// Check for channel to be closed
+						// It means either transaction was abortted or committed
+						fmt.Printf("%v", args.Key)
+						fmt.Println("listening to abort channel")
+						// <-tx.abort
+						break
+					}
+				} else {
+
+					close(tx.abort)
+
+					reply.Error = "Aborted: read timestamp <= committed write timestamp"
+
+					errorMessage := fmt.Sprintf("Read %v", args.Key)
+					return errors.New(errorMessage)
+				}
+			}
+		} else {
+			reply.Error = "Key not found"
+		}
+	} else {
+		reply.Error = "Transaction not found"
+	}
+	return nil
+}
+
+func get_max_RTS(key *KEY) Timestamp {
+	if len(key.RTS) == 0 {
+		return Timestamp(0) // assume there is a value with timestamp of 0
+	}
+
+	max := key.RTS[0] // assume first element is max
+	for _, rts := range key.RTS {
+		if rts > max {
+			max = rts
+		}
+	}
+
+	return max
+}
+
+func (s *TransactionService) Write(args *WriteArgs, reply *WriteReply) error {
+	// Get client transaction
+	tx, ok := transaction[args.TxID]
+
+	if ok {
+		// Get Tc of client
+		Tc := tx.Timestamp
+
+		// Get key the client asked for
+		key, ok := store[args.Key]
+
+		if ok {
+			max_RTS := get_max_RTS(key)
+			max_TW := get_D_of_maximum_TW(Tc, key)
+
+			if Tc >= Timestamp(max_RTS) {
+				if Tc > max_TW {
+					key.TW[Tc] = args.Value
+				} else {
+					reply.Error = "Aborted: write timestamp <= committed write timestamp"
+					// Close the channel
+					close(tx.abort)
+					errorMessage := fmt.Sprintf("Write %v = %v", args.Key, args.Value)
+					return errors.New(errorMessage)
+
+				}
+			} else {
+				// Close the channel
+				close(tx.abort)
+				reply.Error = "Aborted: write timestamp < max read timestamp"
+
+				errorMessage := fmt.Sprintf("Write %v = %v", args.Key, args.Value)
+				return errors.New(errorMessage)
+
 			}
 		} else {
 			reply.Error = "Key not found"
@@ -102,39 +230,78 @@ func (s TransactionService) Read(args *ReadArgs, reply *ReadReply) error {
 	return nil
 }
 
-func (s *TransactionService) Write(args *WriteArgs, reply *WriteReply) error {
-	return nil
-}
-
 func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error {
+	// Get client transaction
+	tx, ok := transaction[args.TxID]
+	if !ok {
+		reply.Error = "Transaction not found"
+		return nil
+	}
+
+	// Check if transaction was aborted
+	select {
+	case <-tx.abort:
+		// Channel closed: aborted
+		reply.Error = "Commit failed: transaction has been aborted"
+		return nil
+	default:
+	}
+
+	// Applying tentative writes to committed store
+	for _, key := range store {
+		// Check if transaction wrote to this key
+		if val, ok := key.TW[tx.Timestamp]; ok {
+			// Commit the value
+			key.committed_value = val
+			key.committed_timestamp = tx.Timestamp
+
+			// Remove from tentative writes
+			delete(key.TW, tx.Timestamp)
+		}
+	}
+
+	reply.Success = true
 	return nil
 }
 
 func main() {
+	// Create store with x and y with value of 0 to all
+	store["x"] = &KEY{} // Create empty KEY
+	store["x"].committed_value = 0
+	store["x"].committed_timestamp = 0
+	store["x"].RTS = append(store["x"].RTS, Timestamp(0))
+
+	store["y"] = &KEY{} // Create empty KEY
+	store["y"].committed_value = 0
+	store["y"].committed_timestamp = 0
+	store["y"].RTS = append(store["y"].RTS, Timestamp(0))
+
+	// Create timestamp with 0 value
+	ts := Timestamp(0)
+
+	// Create TW and put timestamp and value to 0
+	store["x"].TW = make(map[Timestamp]int)
+	store["x"].TW[ts] = 0
+
+	// Create TW and put timestamp and value to 0
+	store["y"].TW = make(map[Timestamp]int)
+	store["y"].TW[ts] = 0
+
 	// Functions aviable
 	transaction := new(TransactionService)
 	rpc.Register(transaction) // Register RPC service
 
-	// Create store with x and y with value of 0
-	store["x"] = &KEY{} // Create empty KEY
-	store["x"].committed_value = 0
-	store["x"].committed_timestamp = 0
-	store["x"].RTS = append(store["x"].RTS, 0)
-	store["x"].TW = make(map[Timestamp]int)
+	sockAddr := "/tmp/rpc.sock"
+	os.Remove(sockAddr)
 
-	store["y"] = &KEY{}
-	store["y"].committed_value = 0
-	store["y"].committed_timestamp = 0
-	store["y"].RTS = append(store["y"].RTS, 0)
-	store["y"].TW = make(map[Timestamp]int)
-
-	listener, err := net.Listen("tcp", ":4000") // Create TCP listener on port 4000
+	listener, err := net.Listen("unix", sockAddr)
+	// listener, err := net.Listen("tcp", ":4000") // Create TCP listener on port 4000
 	if err != nil {
 		log.Fatal("Listen error:", err)
 	}
 	defer listener.Close() // Close listener when main exits
 
-	fmt.Println("Server listening on TCP port 1234")
+	// fmt.Println("Server listening on TCP port 1234")
 
 	for { // Note: this is an infinite loop
 		conn, err := listener.Accept() // Accept the next incoming call and
