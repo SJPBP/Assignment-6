@@ -54,7 +54,6 @@ type Timestamp int64
 type Transaction struct {
 	Timestamp Timestamp
 	TxID      string
-	abort     chan bool
 }
 
 // Create map to store every transaction
@@ -66,6 +65,7 @@ type KEY struct {
 	committed_timestamp Timestamp
 	RTS                 []Timestamp
 	TW                  map[Timestamp]int
+	waitChans           chan bool
 }
 
 // Create empty store map
@@ -83,8 +83,6 @@ func (s *TransactionService) BeginTransaction(args *BeginArgs, reply *BeginReply
 	transaction[args.TxID] = &Transaction{
 		Timestamp: ts,
 		TxID:      args.TxID,
-		// Create the abort channel
-		abort: make(chan bool),
 	}
 
 	return nil
@@ -146,14 +144,10 @@ func (s TransactionService) Read(args *ReadArgs, reply *ReadReply) error {
 					} else {
 						// Check for channel to be closed
 						// It means either transaction was abortted or committed
-						fmt.Printf("%v", args.Key)
-						fmt.Println("listening to abort channel")
-						// <-tx.abort
+						<-key.waitChans
 						break
 					}
 				} else {
-
-					close(tx.abort)
 
 					reply.Error = "Aborted: read timestamp <= committed write timestamp"
 
@@ -202,18 +196,21 @@ func (s *TransactionService) Write(args *WriteArgs, reply *WriteReply) error {
 
 			if Tc >= Timestamp(max_RTS) {
 				if Tc > max_TW {
+					// Add client timestamp and value to tentative write
 					key.TW[Tc] = args.Value
+
+					// Create a channel for current key
+					// Stops reading until committed
+					key.waitChans = make(chan bool)
 				} else {
 					reply.Error = "Aborted: write timestamp <= committed write timestamp"
-					// Close the channel
-					close(tx.abort)
+
 					errorMessage := fmt.Sprintf("Write %v = %v", args.Key, args.Value)
 					return errors.New(errorMessage)
 
 				}
 			} else {
 				// Close the channel
-				close(tx.abort)
 				reply.Error = "Aborted: write timestamp < max read timestamp"
 
 				errorMessage := fmt.Sprintf("Write %v = %v", args.Key, args.Value)
@@ -238,15 +235,6 @@ func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error 
 		return nil
 	}
 
-	// Check if transaction was aborted
-	select {
-	case <-tx.abort:
-		// Channel closed: aborted
-		reply.Error = "Commit failed: transaction has been aborted"
-		return nil
-	default:
-	}
-
 	// Applying tentative writes to committed store
 	for _, key := range store {
 		// Check if transaction wrote to this key
@@ -257,6 +245,9 @@ func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error 
 
 			// Remove from tentative writes
 			delete(key.TW, tx.Timestamp)
+
+			// Close the key channel to allow reading
+			close(key.waitChans)
 		}
 	}
 
@@ -266,6 +257,8 @@ func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error 
 
 func main() {
 	// Create store with x and y with value of 0 to all
+	// Create the abort channel
+
 	store["x"] = &KEY{} // Create empty KEY
 	store["x"].committed_value = 0
 	store["x"].committed_timestamp = 0
