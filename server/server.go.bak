@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/rpc"
 	"os"
-	"slices"
 	"time"
 )
 
@@ -105,8 +104,14 @@ func get_D_of_maximum_TW(Tc Timestamp, key *KEY) Timestamp {
 }
 
 func add_RTS(Tc Timestamp, key *KEY) {
-	// Add Tc to RTS if not already in it
-	if !slices.Contains(key.RTS, Tc) {
+	already_present := false
+	for _, rts := range key.RTS {
+		if rts == Tc {
+			already_present = true
+			break
+		}
+	}
+	if !already_present {
 		key.RTS = append(key.RTS, Tc)
 	}
 }
@@ -125,31 +130,15 @@ func (s TransactionService) Read(args *ReadArgs, reply *ReadReply) error {
 		if ok {
 			for {
 				if Tc > Timestamp(key.committed_timestamp) {
-					// version of D with the maximum write timestamp ≤ Tc
 					D_selected := get_D_of_maximum_TW(Tc, key)
 
-					fmt.Printf("\nD_selected for %v %v \n Tc: %v\n", args.Key, D_selected, Tc)
-
 					if key.committed_timestamp == Timestamp(D_selected) {
-						// Return the value of D_selected
 						reply.Value = key.TW[D_selected]
-
-						// Update the RTS with Tc
 						add_RTS(Tc, key)
-
-						fmt.Printf("\nRTS for %v: %v\n", args.Key, key.RTS)
-
 						break
 
 					} else if D_selected == Tc {
-						// Return the value of D_selected
 						reply.Value = key.TW[D_selected]
-
-						// Update the RTS with Tc
-						add_RTS(Tc, key)
-
-						fmt.Printf("\nRTS for %v: %v\n", args.Key, key.RTS)
-
 						break
 
 					} else {
@@ -203,12 +192,7 @@ func (s *TransactionService) Write(args *WriteArgs, reply *WriteReply) error {
 
 		if ok {
 			max_RTS := get_max_RTS(key)
-			fmt.Printf("\nMax RTS for %v %v \n Tc: %v\n", args.Key, max_RTS, Tc)
-
-			max_TW := key.committed_timestamp
-			// max_TW := get_D_of_maximum_TW_of_committed(Tc, key)
-			//
-			fmt.Printf("\nMax TW for %v %v \n Tc: %v\n", args.Key, max_TW, Tc)
+			max_TW := get_D_of_maximum_TW(Tc, key)
 
 			if Tc >= Timestamp(max_RTS) {
 				if Tc > max_TW {
@@ -252,7 +236,7 @@ func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error 
 	}
 
 	// Applying tentative writes to committed store
-	for keyName, key := range store {
+	for _, key := range store {
 		// Check if transaction wrote to this key
 		if val, ok := key.TW[tx.Timestamp]; ok {
 			// Commit the value
@@ -263,20 +247,7 @@ func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error 
 			delete(key.TW, tx.Timestamp)
 
 			// Close the key channel to allow reading
-			if key.waitChans != nil {
-				select {
-				case <-key.waitChans:
-					// already closed, do nothing
-				default:
-					close(key.waitChans)
-				}
-			}
-
-			fmt.Printf("\n%v state:\n", keyName)
-			fmt.Printf("committed value = %v\n", key.committed_value)
-			fmt.Printf("committed timestamp = %v\n", key.committed_timestamp)
-			fmt.Printf("RTS: %v\n", key.RTS)
-			fmt.Printf("TW: %v\n", key.TW)
+			close(key.waitChans)
 		}
 	}
 
