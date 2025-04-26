@@ -55,7 +55,6 @@ type Timestamp int64
 type Transaction struct {
 	Timestamp Timestamp
 	TxID      string
-	Key       []string
 }
 
 // Create map to store every transaction
@@ -67,8 +66,7 @@ type KEY struct {
 	committed_timestamp Timestamp
 	RTS                 []Timestamp
 	TW                  map[Timestamp]int
-	waitChans           map[Timestamp]chan bool
-	// waitChans           chan bool
+	waitChans           chan bool
 }
 
 // Create empty store map
@@ -92,7 +90,7 @@ func (s *TransactionService) BeginTransaction(args *BeginArgs, reply *BeginReply
 }
 
 func get_D_of_maximum_TW(Tc Timestamp, key *KEY) Timestamp {
-	max_TW := key.committed_timestamp // Start from committed timestamp
+	var max_TW Timestamp
 	var found bool
 
 	for ts := range key.TW {
@@ -104,21 +102,6 @@ func get_D_of_maximum_TW(Tc Timestamp, key *KEY) Timestamp {
 		}
 	}
 	return max_TW
-}
-
-func remove_Tc_from_TW_and_waitChans(Tc Timestamp, key *KEY) {
-	// Remove Tc from tentative writes
-	if _, exists := key.TW[Tc]; exists {
-		delete(key.TW, Tc)
-	}
-
-	// Remove Tc from waitChans
-	if ch, exists := key.waitChans[Tc]; exists {
-		// First, close the channel
-		close(ch)
-		// Then delete the entry
-		delete(key.waitChans, Tc)
-	}
 }
 
 func add_RTS(Tc Timestamp, key *KEY) {
@@ -147,44 +130,43 @@ func (s TransactionService) Read(args *ReadArgs, reply *ReadReply) error {
 					// version of D with the maximum write timestamp ≤ Tc
 					max_TW := get_D_of_maximum_TW(Tc, key)
 
+					fmt.Printf("\nD_selected for %v %v \n Tc: %v\n", args.Key, max_TW, Tc)
+
 					if key.committed_timestamp == max_TW {
+						fmt.Println("\nMax timestamp is from less of Tc")
 						// Return the value of D_selected
 						reply.Value = key.TW[max_TW]
 
 						// Update the RTS with Tc
 						add_RTS(Tc, key)
+
+						fmt.Printf("\nRTS for %v: %v\n", args.Key, key.RTS)
 
 						break
 
 					} else if max_TW == Tc {
+						fmt.Println("\nMax timestamp is Tc")
 						// Return the value of D_selected
 						reply.Value = key.TW[max_TW]
 
 						// Update the RTS with Tc
 						add_RTS(Tc, key)
 
+						fmt.Printf("\nRTS for %v: %v\n", args.Key, key.RTS)
+
 						break
 
 					} else {
-						fmt.Println(max_TW)
-						// Get the channel for tentative write
-						if ch, exists := key.waitChans[max_TW]; exists {
-							// Wait for the channel to be closed
-							// It means either transaction was abortted or committed
-
-							<-ch
-						}
-
-						continue
+						// Check for channel to be closed
+						// It means either transaction was abortted or committed
+						<-key.waitChans
+						break
 					}
 				} else {
 
 					reply.Error = "Aborted: read timestamp <= committed write timestamp"
 
-					// Remove Tc from tentative write
-					remove_Tc_from_TW_and_waitChans(Tc, key)
-
-					errorMessage := fmt.Sprintf("Aborted: read timestamp <= committed write timestamp - Read %v", args.Key)
+					errorMessage := fmt.Sprintf("Read %v", args.Key)
 					return errors.New(errorMessage)
 				}
 			}
@@ -226,40 +208,34 @@ func (s *TransactionService) Write(args *WriteArgs, reply *WriteReply) error {
 
 		if ok {
 			max_RTS := get_max_RTS(key)
+			fmt.Printf("\nMax RTS for %v %v \n Tc: %v\n", args.Key, max_RTS, Tc)
 
 			max_TW := key.committed_timestamp
+			// max_TW := get_D_of_maximum_TW_of_committed(Tc, key)
+			//
+			fmt.Printf("\nMax TW for %v %v \n Tc: %v\n", args.Key, max_TW, Tc)
 
 			if Tc >= Timestamp(max_RTS) {
 				if Tc > max_TW {
+					fmt.Println("\nAdding Value to TW")
 					// Add client timestamp and value to tentative write
 					key.TW[Tc] = args.Value
 
-					// Tell what key the transaction is working on
-					tx.Key = append(tx.Key, args.Key)
-
-					// Create a channel for Tc
-					newChan := make(chan bool)
-
-					// and add it to channels map
-					key.waitChans[Tc] = newChan
-
+					// Create a channel for current key
+					// Stops reading until committed
+					key.waitChans = make(chan bool)
 				} else {
 					reply.Error = "Aborted: write timestamp <= committed write timestamp"
 
-					// Remove Tc from tentative write
-					remove_Tc_from_TW_and_waitChans(Tc, key)
-
-					errorMessage := fmt.Sprintf("Aborted: write timestamp <= committed write timestamp - Write %v = %v", args.Key, args.Value)
+					errorMessage := fmt.Sprintf("Aborted: write timestamp <= committed write timestamp\nWrite %v = %v", args.Key, args.Value)
 					return errors.New(errorMessage)
 
 				}
 			} else {
+				// Close the channel
 				reply.Error = "Aborted: write timestamp < max read timestamp"
 
-				// Remove Tc from tentative write
-				remove_Tc_from_TW_and_waitChans(Tc, key)
-
-				errorMessage := fmt.Sprintf("Aborted: write timestamp < max read timestamp - Write %v = %v", args.Key, args.Value)
+				errorMessage := fmt.Sprintf("Aborted: write timestamp < max read timestamp\nWrite %v = %v", args.Key, args.Value)
 				return errors.New(errorMessage)
 
 			}
@@ -274,41 +250,40 @@ func (s *TransactionService) Write(args *WriteArgs, reply *WriteReply) error {
 }
 
 func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error {
-	fmt.Println("Running Commit")
+	// Get client transaction
 	tx, ok := transaction[args.TxID]
 	if !ok {
 		reply.Error = "Transaction not found"
-		errorMessage := fmt.Sprintf("%v - ", tx.Timestamp)
-		return errors.New(errorMessage)
+		return nil
 	}
 
-	for _, keyName := range tx.Key {
-		key := store[keyName]
-
-		// Wait for older transaction in TW to be done
-		for otherTs := range key.TW {
-			if otherTs < tx.Timestamp {
-				if ch, exists := key.waitChans[otherTs]; exists {
-					fmt.Printf("[Commit] T%v waiting for T%v on %v to finish...\n", tx.Timestamp, otherTs, keyName)
-					<-ch
-				}
-			}
-		}
-
-		// after waiting, commit the tentative write
+	// Applying tentative writes to committed store
+	for keyName, key := range store {
+		// Check if transaction wrote to this key
 		if val, ok := key.TW[tx.Timestamp]; ok {
+			// Commit the value
 			key.committed_value = val
 			key.committed_timestamp = tx.Timestamp
-			remove_Tc_from_TW_and_waitChans(tx.Timestamp, key)
-		}
 
-		// Print the key state
-		fmt.Printf("\n%v state:\n", tx.Key)
-		fmt.Printf("committed value = %v\n", key.committed_value)
-		fmt.Printf("committed timestamp = %v\n", key.committed_timestamp)
-		fmt.Printf("RTS: %v\n", key.RTS)
-		fmt.Printf("TW: %v\n", key.TW)
-		fmt.Printf("waitChan: %v\n", key.waitChans)
+			// Remove from tentative writes
+			delete(key.TW, tx.Timestamp)
+
+			// Close the key channel to allow reading
+			if key.waitChans != nil {
+				select {
+				case <-key.waitChans:
+					// already closed, do nothing
+				default:
+					close(key.waitChans)
+				}
+			}
+
+			fmt.Printf("\n%v state:\n", keyName)
+			fmt.Printf("committed value = %v\n", key.committed_value)
+			fmt.Printf("committed timestamp = %v\n", key.committed_timestamp)
+			fmt.Printf("RTS: %v\n", key.RTS)
+			fmt.Printf("TW: %v\n", key.TW)
+		}
 	}
 
 	reply.Success = true
@@ -319,44 +294,26 @@ func main() {
 	// Create store with x and y with value of 0 to all
 	// Create the abort channel
 
-	store["x"] = &KEY{
-		committed_value:     0,
-		committed_timestamp: 0,
-		RTS:                 make([]Timestamp, 0),
-		TW:                  make(map[Timestamp]int),
-		waitChans:           make(map[Timestamp]chan bool),
-	}
+	store["x"] = &KEY{} // Create empty KEY
+	store["x"].committed_value = 0
+	store["x"].committed_timestamp = 0
+	store["x"].RTS = append(store["x"].RTS, Timestamp(0))
 
-	store["y"] = &KEY{
-		committed_value:     0,
-		committed_timestamp: 0,
-		RTS:                 make([]Timestamp, 0),
-		TW:                  make(map[Timestamp]int),
-		waitChans:           make(map[Timestamp]chan bool),
-	}
-
-	// store["x"] = &KEY{} // Create empty KEY
-	// store["x"].committed_value = 0
-	// store["x"].committed_timestamp = 0
-	// store["x"].RTS = make([]Timestamp, 0)
-	// store["x"].TW = make(map[Timestamp]int)
-	//
-	// store["y"] = &KEY{} // Create empty KEY
-	// store["y"].committed_value = 0
-	// store["y"].committed_timestamp = 0
-	// store["y"].RTS = make([]Timestamp, 0)
-	// store["y"].TW = make(map[Timestamp]int)
-
-	// store["y"].RTS = append(store["y"].RTS, Timestamp(0))
+	store["y"] = &KEY{} // Create empty KEY
+	store["y"].committed_value = 0
+	store["y"].committed_timestamp = 0
+	store["y"].RTS = append(store["y"].RTS, Timestamp(0))
 
 	// Create timestamp with 0 value
-	// ts := Timestamp(0)
+	ts := Timestamp(0)
 
 	// Create TW and put timestamp and value to 0
-	// store["x"].TW[ts] = 0
+	store["x"].TW = make(map[Timestamp]int)
+	store["x"].TW[ts] = 0
 
 	// Create TW and put timestamp and value to 0
-	// store["y"].TW[ts] = 0
+	store["y"].TW = make(map[Timestamp]int)
+	store["y"].TW[ts] = 0
 
 	// Functions aviable
 	transaction := new(TransactionService)
