@@ -274,33 +274,38 @@ func (s *TransactionService) Write(args *WriteArgs, reply *WriteReply) error {
 }
 
 func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error {
-	fmt.Println("Running Commit")
+	fmt.Printf("[%s] Attempting to commit\n", args.TxID)
+	
+	// Get transaction
 	tx, ok := transaction[args.TxID]
 	if !ok {
 		reply.Error = "Transaction not found"
-		errorMessage := fmt.Sprintf("%v - ", tx.Timestamp)
-		return errors.New(errorMessage)
+		fmt.Printf("[%s] Error: %s\n", args.TxID, reply.Error)
+		return errors.New(reply.Error)
 	}
 
+	// For each key the transaction has written to
 	for _, keyName := range tx.Key {
 		key := store[keyName]
 
-		// Wait for older transaction in TW to be done
+		// Wait for all transactions with lower timestamps in TW to complete
 		for otherTs := range key.TW {
 			if otherTs < tx.Timestamp {
 				if ch, exists := key.waitChans[otherTs]; exists {
-					fmt.Printf("[Commit] T%v waiting for T%v on %v to finish...\n", tx.Timestamp, otherTs, keyName)
+					fmt.Printf("[%s] Waiting for transaction with timestamp %v to finish...\n", args.TxID, otherTs)
 					<-ch
 				}
 			}
 		}
 
-		// after waiting, commit the tentative write
-		if val, ok := key.TW[tx.Timestamp]; ok {
+		// After waiting, apply the tentative write to the store
+		if val, exists := key.TW[tx.Timestamp]; exists {
 			key.committed_value = val
 			key.committed_timestamp = tx.Timestamp
-			remove_Tc_from_TW_and_waitChans(tx.Timestamp, key)
+			// Remove from TW but keep in RTS
+			delete(key.TW, tx.Timestamp)
 		}
+
 
 		// Print the key state
 		fmt.Printf("\n%v state:\n", tx.Key)
@@ -309,6 +314,33 @@ func (s *TransactionService) Commit(args *CommitArgs, reply *CommitReply) error 
 		fmt.Printf("RTS: %v\n", key.RTS)
 		fmt.Printf("TW: %v\n", key.TW)
 		fmt.Printf("waitChan: %v\n", key.waitChans)
+
+		// Close the wait channel to notify other transactions
+		if ch, exists := key.waitChans[tx.Timestamp]; exists {
+			close(ch)
+			delete(key.waitChans, tx.Timestamp)
+		}
+
+		// Print state of the key after commit
+		fmt.Printf("[%s] Commit value of %s = %d\n", args.TxID, keyName, key.committed_value)
+	}
+
+	// Print commit success message
+	fmt.Printf("[%s] Commit succeeded\n", args.TxID)
+	
+	// Make sure to also print the other key's value if not in tx.Key
+	allKeys := []string{"x", "y"}
+	for _, keyName := range allKeys {
+		keyFound := false
+		for _, txKey := range tx.Key {
+			if txKey == keyName {
+				keyFound = true
+				break
+			}
+		}
+		if !keyFound {
+			fmt.Printf("[%s] Commit value of %s = %d\n", args.TxID, keyName, store[keyName].committed_value)
+		}
 	}
 
 	reply.Success = true
@@ -319,6 +351,7 @@ func main() {
 	// Create store with x and y with value of 0 to all
 	// Create the abort channel
 
+	fmt.Printf("Starting server...")
 	store["x"] = &KEY{
 		committed_value:     0,
 		committed_timestamp: 0,
