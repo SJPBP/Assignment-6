@@ -1,5 +1,7 @@
 // server.go
 // Prabhdeep Singh
+// David Majomi
+// dom22
 // ps1282
 package main
 
